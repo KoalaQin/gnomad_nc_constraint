@@ -13,15 +13,28 @@ gcloud compute scp /Users/qinhe/PycharmProjects/gnomad_lof/constraint_utils/*.py
 
 hailctl dataproc submit qh1 gnocchi_1kb_by_interval.py -- \
   --region chrX_nonPAR \
-  --output-bucket gs://qin-gnocchi/tmp-30day \
-  --output-suffix genome_1kb_chrX_nonPAR
+  --output-bucket gs://qin-gnocchi/gnocchi_files \
+  --output-suffix genome_1kb_chrX_nonPAR \
+  --dry-run
 
 hailctl dataproc submit qh1 gnocchi_1kb_by_interval.py -- \
   --region chrX_PAR \
-  --output-bucket gs://qin-gnocchi/tmp-30day \
+  --output-bucket gs://qin-gnocchi/gnocchi_files \
   --output-suffix genome_1kb_chrX_PAR
 
 hailctl dataproc submit qh1 gnocchi_1kb_by_interval.py -- \
   --interval '[chr22:start-end]' \
-  --output-bucket gs://qin-gnocchi/tmp-30day \
+  --output-bucket gs://qin-gnocchi/gnocchi_files \
   --output-suffix genome_1kb_chr22
+
+
+oe_ht = hl.read_table(out_ht)
+
+    z = calculate_z(oe_ht, oe_ht.observed, oe_ht.expected, "gnocchi")
+    z_adj = calculate_z(oe_ht, oe_ht.observed, oe_ht.expected_adj, "gnocchi_adj")
+
+    oe_ht = oe_ht.annotate(
+        gnocchi=z[oe_ht.key].gnocchi,
+        gnocchi_adj=z_adj[oe_ht.key].gnocchi_adj,
+    )
+
