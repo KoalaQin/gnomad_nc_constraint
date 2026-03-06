@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/gnomad_nc_constraint.iml" filepath="$PROJECT_DIR$/.idea/gnomad_nc_constraint.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../gnomad_qc/.idea/gnomad_qc.iml" filepath="$PROJECT_DIR$/../gnomad_qc/.idea/gnomad_qc.iml" />
+    </modules>
+  </component>
+</project>

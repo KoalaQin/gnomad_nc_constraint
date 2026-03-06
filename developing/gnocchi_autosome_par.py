@@ -1,10 +1,19 @@
 # This code is adapted from Siwei's code `compute_gnocchi_by_element.py`
-from typing import Optional, Sequence, Union, Dict, List
+from typing import Optional, Sequence
+import logging
+import time
 
 import hail as hl
 import argparse
 from gnomad.utils.filtering import filter_by_intervals, filter_low_conf_regions
 from constraint_utils.nc_constraint_utils import remove_coverage_outliers
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ----------------------------
 # Config
@@ -23,12 +32,37 @@ REGION_INTERVALS = {
         "[chrX:10000-2781479]",
         "[chrX:155701383-156030895]",
     ],
-    "chrX_nonPAR": [
-        "[chrX:1-9999]",
-        "[chrX:2781480-155701382]",
-        "[chrX:156030896-156040895]",
-    ],
 }
+
+AUTOSOME_CONTIGS = [f"chr{i}" for i in range(1, 23)]
+
+
+def get_autosome_intervals() -> Sequence[hl.Interval]:
+    """Build one interval per autosome spanning the full contig, using reference lengths."""
+    return [
+        hl.Interval(
+            hl.Locus(c, 1, reference_genome=REFGENOME_NAME),
+            hl.Locus(c, REFGENOME.lengths[c], reference_genome=REFGENOME_NAME),
+            includes_end=True,
+        )
+        for c in AUTOSOME_CONTIGS
+    ]
+
+
+# ----------------------------
+# Load reference BEDs
+# ----------------------------
+blacklist_bed = hl.import_bed(
+    BLACKLIST_BED_PATH,
+    reference_genome=REFGENOME_NAME,
+    skip_invalid_intervals=True,
+)
+
+element_bed = hl.import_bed(
+    BED_1KB_PATH,
+    reference_genome=REFGENOME_NAME,
+    skip_invalid_intervals=True,
+)
 
 
 def parse_intervals(interval_strs: Sequence[str]) -> Sequence[hl.Interval]:
@@ -37,14 +71,19 @@ def parse_intervals(interval_strs: Sequence[str]) -> Sequence[hl.Interval]:
     ]
 
 
-def filter_black_regions(ht: hl.Table, blacklist_bed: hl.Table) -> hl.Table:
+def filter_black_regions(ht: hl.Table) -> hl.Table:
+    blacklist_bed = hl.import_bed(
+        BLACKLIST_BED_PATH,
+        reference_genome=REFGENOME_NAME,
+        skip_invalid_intervals=True,
+    )
     return ht.filter(hl.is_defined(blacklist_bed[ht.locus]), keep=False)
 
 
 def annotate_genome_element(
-    ht: hl.Table,
-    element_bed: hl.Table,
-    element_field: str = "element_id",
+        ht: hl.Table,
+        element_bed: hl.Table,
+        element_field: str = "element_id",
 ) -> hl.Table:
     """
     Filter to loci present in element_bed and annotate element IDs.
@@ -60,10 +99,10 @@ def annotate_genome_element(
 
 
 def calculate_z(
-    input_ht: hl.Table,
-    obs: hl.expr.NumericExpression,
-    exp: hl.expr.NumericExpression,
-    output: str = "z_raw",
+        input_ht: hl.Table,
+        obs: hl.expr.NumericExpression,
+        exp: hl.expr.NumericExpression,
+        output: str = "z_raw",
 ) -> hl.Table:
     """
     Compute the signed raw z score using observed and expected variant counts.
@@ -87,28 +126,30 @@ def calculate_z(
 
 
 def prefilter_input_ht(
-    ht: hl.Table,
-    blacklist_ht: Optional[hl.Table] = None,
-    intervals: Optional[Sequence[hl.Interval]] = None,
+        ht: hl.Table,
+        blacklist: bool = False,
+        exclude_lcr_segdup: bool = False,
+        coverage_outliers: bool = False,
+        intervals: Optional[Sequence[hl.Interval]] = None,
 ) -> hl.Table:
     """
-    1) interval filter (optional)
-    2) blacklist filter (optional)
-    3) remove coverage outliers if coverage_mean exists
-    4) lcr and segdup regions
+    Apply common prefilters:
+      1) optional interval restriction
+      2) optional blacklist removal
+      3) optional coverage outlier removal (requires `coverage_mean`)
+      4) optional LCR/segdup removal
     """
     if intervals is not None:
         ht = filter_by_intervals(ht, intervals, reference_genome=REFGENOME_NAME)
 
-    if blacklist_ht is not None:
-        ht = filter_black_regions(ht, blacklist_ht)
+    if blacklist:
+        ht = filter_black_regions(ht)
 
-    if "coverage_mean" in ht.row.dtype.fields:
+    if coverage_outliers and ("coverage_mean" in ht.row.dtype.fields):
         ht = remove_coverage_outliers(ht)
 
-    ht = filter_low_conf_regions(
-        ht, filter_lcr=True, filter_decoy=False, filter_segdup=True
-    )
+    if exclude_lcr_segdup:
+        ht = filter_low_conf_regions(ht, filter_lcr=True, filter_decoy=False, filter_segdup=True)
 
     return ht
 
@@ -118,7 +159,7 @@ def main(args):
 
     if args.dry_run:
         print("=== DRY RUN ===")
-        print(f"Region:        {args.region}")
+        print(f"Region:        {args.region or ('(custom intervals)' if args.interval else '(autosomes default)')}")
         print(f"Intervals:     {[str(i) for i in hl.eval(intervals)]}")
         print(f"AF cutoff:     {args.af_cutoff}")
         print(f"Output bucket: {args.output_bucket}")
@@ -132,60 +173,36 @@ def main(args):
     OUTPUT_BUCKET = args.output_bucket
     SFX = args.output_suffix
 
-    # ----------------------------
-    # Load reference BEDs
-    # ----------------------------
-    blacklist_bed = hl.import_bed(
-        BLACKLIST_BED_PATH,
-        reference_genome=REFGENOME_NAME,
-        skip_invalid_intervals=True,
-    )
-
-    element_bed = hl.import_bed(
-        BED_1KB_PATH,
-        reference_genome=REFGENOME_NAME,
-        skip_invalid_intervals=True,
-    )
+    logger.info("Starting gnocchi run: suffix=%s, af_cutoff=%s", SFX, AF_CUTOFF)
+    t_total = time.time()
 
     # ----------------------------
     # Read base tables
     # ----------------------------
-    if args.region == "chrX_nonPAR":
-        context_rr_ht = hl.read_table(
-            f"{OUTPUT_BUCKET}/context_prepared_chrX_nonPAR_methyl_po_1kb.ht"
-        )
-        context_ht = hl.read_table(
-            f"{OUTPUT_BUCKET}/context_prepared_chrX_nonPAR.ht"
-        )
-        genome_ht = hl.read_table(f"{OUTPUT_BUCKET}/genome_prepared_chrX_nonPAR.ht")
-    else:
-        context_rr_ht = hl.read_table(
-            f"{PUBLIC_BUCKET}/context_prepared_mutation_rate_po_rr_1kb.tmp.ht"
-        )
-        context_ht = hl.read_table(f"{PUBLIC_BUCKET}/context_prepared.ht")
-        genome_ht = hl.read_table(f"{PUBLIC_BUCKET}/genome_prepared.ht")
-    
-    # ----------------------------
-    # Prefilter
-    # ----------------------------
+    logger.info("Reading input HTs")
+    context_rr_ht = hl.read_table(
+        f"{PUBLIC_BUCKET}/context_prepared_mutation_rate_po_rr_1kb.tmp.ht"
+    )
+    context_ht = hl.read_table(f"{PUBLIC_BUCKET}/context_prepared.ht")
+    genome_ht = hl.read_table(f"{PUBLIC_BUCKET}/genome_prepared.ht")
 
+    # ----------------------------
+    # Prefilter + coverage filter + checkpoint
+    # ----------------------------
+    logger.info("Prefiltering and checkpointing")
+    t0 = time.time()
     context_rr_ht = prefilter_input_ht(
-        context_rr_ht, intervals=intervals, blacklist_ht=blacklist_bed
+        context_rr_ht, intervals=intervals, blacklist=True, coverage_outliers=True,
     )
     genome_ht = prefilter_input_ht(
-        genome_ht, intervals=intervals, blacklist_ht=blacklist_bed
+        genome_ht, intervals=intervals, blacklist=True, coverage_outliers=True,
     )
     context_ht = prefilter_input_ht(
-        context_ht, intervals=intervals, blacklist_ht=blacklist_bed
+        context_ht, intervals=intervals, blacklist=True, coverage_outliers=True,
     )
 
-    if args.region == "chrX_nonPAR":
-        # Based on Siwei's notes
-        coverage_mean_lower = 23
-        coverage_mean_upper = 24
-    else:
-        coverage_mean_lower = 30
-        coverage_mean_upper = 32
+    coverage_mean_lower = 30
+    coverage_mean_upper = 32
 
     context_ht = context_ht.filter(
         (context_ht.coverage_mean >= coverage_mean_lower)
@@ -193,31 +210,25 @@ def main(args):
     )
     context_rr_ht = context_rr_ht.semi_join(context_ht)
 
-    # ----------------------------
-    # Checkpoint
-    # ----------------------------
     context_rr_ht = context_rr_ht.checkpoint(
         f"{OUTPUT_BUCKET}/context_rr_{SFX}.ht", overwrite=True
     )
     genome_ht = genome_ht.checkpoint(f"{OUTPUT_BUCKET}/genome_{SFX}.ht", overwrite=True)
+    logger.info("Prefilter + checkpoint done in %.1fs", time.time() - t0)
 
     # ----------------------------
-    # Annotate by 1kb elements
+    # Annotate by 1kb elements + rare variant filter + observed annotation
     # ----------------------------
+    logger.info("Annotating elements and filtering variants")
+    t0 = time.time()
     context_rr_ht = annotate_genome_element(context_rr_ht, element_bed)
     genome_ht = annotate_genome_element(genome_ht, element_bed)
 
-    # ----------------------------
-    # Select & join
-    # ----------------------------
     genome_ht = genome_ht.select(
         "context", "ref", "alt", "methyl_level", "element_id", "freq", "pass_filters"
     )
     genome_join = genome_ht[context_rr_ht.key]
 
-    # ----------------------------
-    # filter for rare & pass qc variants
-    # ----------------------------
     context_rr_ht = context_rr_ht.filter(
         hl.is_missing(genome_join)
         | ((genome_join.freq[0].AF <= AF_CUTOFF) & genome_join.pass_filters)
@@ -226,9 +237,6 @@ def main(args):
         (genome_ht.freq[0].AF <= AF_CUTOFF) & genome_ht.pass_filters
     )
 
-    # ----------------------------
-    # annotate mutation rates (for computing expected) observed (1 or 0)
-    # ----------------------------
     context_rr_ht = context_rr_ht.annotate(
         fitted_po_adj=context_rr_ht.fitted_po * context_rr_ht.rr,
         is_observed=hl.is_defined(genome_ht[context_rr_ht.key]),
@@ -248,10 +256,13 @@ def main(args):
 
     out_ht = f"{OUTPUT_BUCKET}/oe_by_{SFX}.ht"
     by_element_ht.write(out_ht, overwrite=True)
+    logger.info("Aggregation done in %.1fs", time.time() - t0)
 
     # ----------------------------
-    # compute Z scores
+    # Compute Z scores
     # ----------------------------
+    logger.info("Computing Z scores")
+    t0 = time.time()
     oe_ht = hl.read_table(out_ht)
 
     z = calculate_z(oe_ht, oe_ht.observed, oe_ht.expected, "gnocchi")
@@ -287,17 +298,18 @@ def main(args):
         .key_by("element_id")
     )
 
+    pos = oe_ht.element_id.split("-")
+
     oe_ht = oe_ht.annotate(
         pct_pass=pass_ht[oe_ht.key].pct_PASS,
         mean_coverage=cov_ht[oe_ht.key].mean_coverage,
+        chrom=pos[0],
+        start=hl.int(pos[1]),
+        end=hl.int(pos[2]),
     )
 
-    if args.region == "chrX_nonPAR":
-        cov_lower = 20
-        cov_upper = 25
-    else:
-        cov_lower = 25
-        cov_upper = 35
+    cov_lower = 25
+    cov_upper = 35
 
     oe_ht = oe_ht.annotate(
         pass_qc=hl.if_else(
@@ -309,36 +321,38 @@ def main(args):
             False,
         )
     )
+    oe_ht = oe_ht.select("chrom", "start", "end", "observed", "possible", "expected", "expected_adj",
+                         "gnocchi", "gnocchi_adj", "pct_pass", "mean_coverage", "pass_qc")
+    oe_ht.export(f"{OUTPUT_BUCKET}/gnocchi_1kb_{SFX}.txt")
+    logger.info("Z scores + QC done in %.1fs → %s/gnocchi_by_%s.txt", time.time() - t0, OUTPUT_BUCKET, SFX)
+    logger.info("Total runtime: %.1fs", time.time() - t_total)
 
-    oe_ht.export(f"{OUTPUT_BUCKET}/gnocchi_by_{SFX}.txt")
 
-
-def resolve_intervals(args) -> Sequence[hl.Interval]:
+def resolve_intervals(args):
     if args.interval:
-        interval_strs = args.interval
+        return parse_intervals(args.interval)
     elif args.region:
-        interval_strs = REGION_INTERVALS[args.region]
+        return parse_intervals(REGION_INTERVALS[args.region])
     else:
-        raise ValueError("Must provide either --region or --interval")
-
-    return parse_intervals(interval_strs)
+        return get_autosome_intervals()  # default: all autosomes (chr1–chr22)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run gnocchi for chrX PAR / nonPAR or custom intervals"
+        description="Run gnocchi for autosomes, chrX PAR, or custom intervals"
     )
 
     parser.add_argument(
         "--region",
         choices=REGION_INTERVALS.keys(),
-        help="Predefined region to run (chrX_PAR or chrX_nonPAR)",
+        help="Predefined region to run (chrX_PAR)",
     )
 
     parser.add_argument(
         "--interval",
         action="append",
-        help="Custom interval(s), e.g. '[chrX:10000-2781479]'. Can be passed multiple times.",
+        help="Custom interval(s), e.g. '[chr22:1-50818468]'. Can be passed multiple times. "
+             "Defaults to all autosomes (chr1–chr22) if neither --region nor --interval is given.",
     )
 
     parser.add_argument(
