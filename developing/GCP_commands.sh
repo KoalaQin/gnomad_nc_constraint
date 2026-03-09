@@ -1,11 +1,11 @@
-hailctl dataproc start qh3 \
+hailctl dataproc start qh1 \
   --master-machine-type n1-highmem-16 \
   --zone us-central1-c \
   --requester-pays-allow-all \
   --pkgs="git+https://github.com/koalaqin/gnomad_lof.git@main,\
           git+https://github.com/broadinstitute/gnomad_methods.git@main,\
           git+https://github.com/broadinstitute/gnomad_qc.git@main" \
-  --autoscaling-policy=max-100 \
+  --autoscaling-policy=max-10 \
   --labels owner=qin,workload=gnocchi \
   --max-idle 60m
 
@@ -33,3 +33,5 @@ hailctl dataproc submit qh2 gnocchi_chrX_nonPAR_configFinal.py \
     --compute-element-z \
     --pyfiles /Users/qinhe/PyCharmMiscProject/gnomad_nc_constraint/developing/gnocchi_chrX_nonPAR_utils.py \
     --overwrite
+
+hailctl dataproc submit qh1 developing/postprocess_gnocchi_outputs.py
